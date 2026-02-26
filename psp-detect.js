@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * PSP Detector v2 (Puppeteer版)
+ * PSP Detector v3 - カートURL自動推測版
  * Usage: node psp-detect.js [options] <urls-file>
  * Options:
  *   --output <file>       Output CSV file (default: results.csv)
@@ -12,6 +12,41 @@
 const puppeteer = require('puppeteer');
 const fs = require('fs');
 const path = require('path');
+
+// ── カートURLパターン（日本ECサイト向け） ────────────────────────────────────
+const CART_PATHS = [
+  '/cart',
+  '/cart/',
+  '/bag',
+  '/basket',
+  '/basket/',
+  '/shopping/cart',
+  '/shopping-cart',
+  '/shop/cart',
+  '/store/cart',
+  '/ec/cart',
+  '/order/cart',
+  '/checkout',
+  '/checkout/',
+  '/purchase',
+  '/buy',
+  // EC-CUBE
+  '/cart/index',
+  // MakeShop
+  '/cart/cart.aspx',
+  // futureshop
+  '/fs/cart',
+  // カラーミー
+  '/cart/list',
+  // Yahoo!ショッピング風
+  '/ys/cart',
+  // 独自システムでよくあるパターン
+  '/mypage/cart',
+  '/member/cart',
+  '/user/cart',
+  '/sp/cart',
+  '/pc/cart',
+];
 
 // ── PSP Fingerprint Definitions ──────────────────────────────────────────────
 const PSP_DEFINITIONS = [
@@ -107,19 +142,39 @@ const PSP_DEFINITIONS = [
   },
 ];
 
-// ── PSP Detection ─────────────────────────────────────────────────────────────
+// ── EC プラットフォーム検出 ───────────────────────────────────────────────────
+const PLATFORM_DEFINITIONS = [
+  { name: 'Shopify',           patterns: [/cdn\.shopify\.com/i, /shopify\.com\/s\//i, /Shopify\.theme/i] },
+  { name: 'EC-CUBE',           patterns: [/ec-cube/i, /eccube/i] },
+  { name: 'カラーミーショップ',   patterns: [/color-me-shop\.com/i, /shop-pro\.jp/i] },
+  { name: 'MakeShop',          patterns: [/makeshop\.jp/i] },
+  { name: 'futureshop',        patterns: [/future-shop\.jp/i, /futureshop/i] },
+  { name: 'BASE',              patterns: [/base\.ec/i, /thebase\.in/i] },
+  { name: 'STORES',            patterns: [/stores\.jp/i, /stores\.business/i] },
+  { name: 'Yahoo!ショッピング', patterns: [/shopping\.yahooapis\.jp/i, /ystatic\.net.*shopping/i] },
+  { name: '楽天',              patterns: [/rakuten\.co\.jp/i, /r10s\.jp/i] },
+];
+
+// ── PSP / Platform Detection ──────────────────────────────────────────────────
 function detectPSPs(html, networkUrls) {
   const allText = html + '\n' + networkUrls.join('\n');
   const detected = [];
   for (const psp of PSP_DEFINITIONS) {
     for (const pattern of psp.patterns) {
-      if (pattern.test(allText)) {
-        detected.push(psp.name);
-        break;
-      }
+      if (pattern.test(allText)) { detected.push(psp.name); break; }
     }
   }
   return detected;
+}
+
+function detectPlatform(html, networkUrls) {
+  const allText = html + '\n' + networkUrls.join('\n');
+  for (const platform of PLATFORM_DEFINITIONS) {
+    for (const pattern of platform.patterns) {
+      if (pattern.test(allText)) return platform.name;
+    }
+  }
+  return '';
 }
 
 // ── CSV helpers ───────────────────────────────────────────────────────────────
@@ -133,14 +188,16 @@ function csvEscape(value) {
 
 function buildCsv(rows) {
   const allPspNames = PSP_DEFINITIONS.map((p) => p.name);
-  const header = ['URL', 'Status', 'Detected PSPs', 'Error', ...allPspNames];
+  const header = ['入力URL', 'カートURL', 'ステータス', 'プラットフォーム', '検出PSP', 'エラー', ...allPspNames];
   const lines = [header.map(csvEscape).join(',')];
   for (const row of rows) {
     const detectedSet = new Set(row.psps || []);
     const flagCols = allPspNames.map((name) => (detectedSet.has(name) ? '1' : '0'));
     const line = [
-      row.url,
+      row.inputUrl,
+      row.cartUrl || '',
       row.status || '',
+      row.platform || '',
       (row.psps || []).join(' | '),
       row.error || '',
       ...flagCols,
@@ -160,43 +217,73 @@ async function runWithConcurrency(tasks, concurrency) {
       results[i] = await tasks[i]();
     }
   }
-  const workers = Array.from({ length: Math.min(concurrency, tasks.length) }, worker);
-  await Promise.all(workers);
+  await Promise.all(Array.from({ length: Math.min(concurrency, tasks.length) }, worker));
   return results;
 }
 
-// ── Scan one URL with Puppeteer ───────────────────────────────────────────────
-async function scanUrl(browser, targetUrl, timeout, waitMs) {
+// ── カートURL探索 ─────────────────────────────────────────────────────────────
+async function findCartUrl(page, baseUrl, timeout) {
+  const base = new URL(baseUrl);
+  const origin = base.origin;
+
+  for (const cartPath of CART_PATHS) {
+    const cartUrl = origin + cartPath;
+    try {
+      const res = await page.goto(cartUrl, { waitUntil: 'domcontentloaded', timeout: Math.min(timeout, 10000) });
+      if (res && res.status() === 200) {
+        // カートっぽいページか簡易チェック（404ページでも200を返すサイト対策）
+        const content = await page.content();
+        const isCartLike = /cart|カート|basket|bag|ショッピング|買い物|checkout/i.test(content);
+        if (isCartLike) return cartUrl;
+      }
+    } catch (_) {
+      // このパスはスキップ
+    }
+  }
+  return null;
+}
+
+// ── 1サイトをスキャン ─────────────────────────────────────────────────────────
+async function scanSite(browser, inputUrl, timeout, waitMs) {
   const page = await browser.newPage();
   const networkUrls = [];
 
-  // ネットワークリクエストを傍受してPSP関連URLを収集
-  page.on('request', (req) => {
-    networkUrls.push(req.url());
-  });
+  page.on('request', (req) => networkUrls.push(req.url()));
 
-  // UA偽装（ボット判定回避）
   await page.setUserAgent(
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
   );
   await page.setExtraHTTPHeaders({ 'Accept-Language': 'ja-JP,ja;q=0.9,en;q=0.8' });
 
-  let status = '';
   try {
-    const response = await page.goto(targetUrl, {
-      waitUntil: 'networkidle2',
-      timeout,
-    });
-    status = response ? response.status() : '';
+    // Step1: トップページでプラットフォーム検出
+    await page.goto(inputUrl, { waitUntil: 'domcontentloaded', timeout });
+    const topHtml = await page.content();
+    const platform = detectPlatform(topHtml, networkUrls);
 
-    // JS実行後の追加待機
+    // Step2: カートURL探索
+    const cartUrl = await findCartUrl(page, inputUrl, timeout);
+
+    if (!cartUrl) {
+      // カートページが見つからない場合はトップページで判定
+      const psps = detectPSPs(topHtml, networkUrls);
+      return { inputUrl, cartUrl: '(未発見)', status: '-', platform, psps, error: 'カートページ未発見' };
+    }
+
+    // Step3: カートページでPSP検出
+    networkUrls.length = 0; // ネットワークログをリセット
+    const res = await page.goto(cartUrl, { waitUntil: 'networkidle2', timeout });
+    const status = res ? res.status() : '';
+
+    // JS実行待機
     await new Promise((r) => setTimeout(r, waitMs));
 
     const html = await page.content();
     const psps = detectPSPs(html, networkUrls);
-    return { url: targetUrl, status, psps, error: '' };
+
+    return { inputUrl, cartUrl, status, platform, psps, error: '' };
   } catch (err) {
-    return { url: targetUrl, status, psps: [], error: err.message };
+    return { inputUrl, cartUrl: '', status: '', platform: '', psps: [], error: err.message };
   } finally {
     await page.close();
   }
@@ -230,8 +317,7 @@ async function main() {
     process.exit(1);
   }
 
-  const rawUrls = fs
-    .readFileSync(urlsFile, 'utf8')
+  const rawUrls = fs.readFileSync(urlsFile, 'utf8')
     .split('\n')
     .map((l) => l.trim())
     .filter((l) => l && !l.startsWith('#'));
@@ -241,7 +327,7 @@ async function main() {
     process.exit(1);
   }
 
-  console.log(`\n🔍 PSP Detector v2 (Puppeteer)`);
+  console.log(`\n🔍 PSP Detector v3 (カートURL自動推測版)`);
   console.log(`   URLs:        ${rawUrls.length}`);
   console.log(`   Concurrency: ${concurrency}`);
   console.log(`   Timeout:     ${timeout}ms`);
@@ -256,14 +342,18 @@ async function main() {
   let completed = 0;
 
   const tasks = rawUrls.map((rawUrl) => async () => {
-    const targetUrl = /^https?:\/\//i.test(rawUrl) ? rawUrl : `https://${rawUrl}`;
-    const result = await scanUrl(browser, targetUrl, timeout, waitMs);
-
+    const inputUrl = /^https?:\/\//i.test(rawUrl) ? rawUrl : `https://${rawUrl}`;
+    const result = await scanSite(browser, inputUrl, timeout, waitMs);
     completed++;
-    const pspLabel = result.psps.length > 0 ? result.psps.join(', ') : 'none';
-    const statusLabel = result.error ? 'ERROR' : `HTTP ${result.status}`;
-    console.log(`[${completed}/${rawUrls.length}] ${statusLabel.padEnd(10)} ${targetUrl} → ${pspLabel}`);
 
+    const pspLabel = result.psps.length > 0 ? result.psps.join(', ') : 'none';
+    const platformLabel = result.platform || '不明';
+    console.log(
+      `[${completed}/${rawUrls.length}] ${inputUrl}\n` +
+      `   プラットフォーム: ${platformLabel}\n` +
+      `   カートURL: ${result.cartUrl || 'なし'}\n` +
+      `   PSP: ${pspLabel}\n`
+    );
     return result;
   });
 
@@ -271,16 +361,18 @@ async function main() {
   await browser.close();
 
   const bom = '\uFEFF';
-  const csv = bom + buildCsv(results);
-  fs.writeFileSync(outputFile, csv, 'utf8');
+  fs.writeFileSync(outputFile, bom + buildCsv(results), 'utf8');
 
   const detected = results.filter((r) => r.psps && r.psps.length > 0).length;
-  const errors = results.filter((r) => r.error).length;
+  const cartFound = results.filter((r) => r.cartUrl && r.cartUrl !== '(未発見)').length;
+  const errors = results.filter((r) => r.error && r.cartUrl !== '(未発見)').length;
+
   console.log(`\n✅ Done!`);
-  console.log(`   Total:    ${results.length}`);
-  console.log(`   Detected: ${detected} sites with PSPs`);
-  console.log(`   Errors:   ${errors}`);
-  console.log(`   Output:   ${path.resolve(outputFile)}\n`);
+  console.log(`   合計:           ${results.length} サイト`);
+  console.log(`   カートURL発見:  ${cartFound} サイト`);
+  console.log(`   PSP検出:        ${detected} サイト`);
+  console.log(`   エラー:         ${errors} サイト`);
+  console.log(`   出力:           ${path.resolve(outputFile)}\n`);
 }
 
 main().catch((err) => {
