@@ -1,4 +1,4 @@
 # PSP Detector - URLリスト
 # 1行1URL（#から始まる行はコメント）
-https://www.beams.co.jp/cart/cart.aspx
-https://www.uniqlo.com/jp/ja/cart
+https://www.beams.co.jp
+https://www.uniqlo.com/jp/ja
