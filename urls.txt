@@ -1,0 +1,5 @@
+# PSP Detector - URLリスト
+# 1行1URL（#から始まる行はコメント）
+https://example.com
+https://stripe.com
+https://paypal.com
