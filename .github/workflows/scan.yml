@@ -14,11 +14,15 @@ on:
       concurrency:
         description: '並列実行数'
         required: false
-        default: '5'
+        default: '3'
       timeout:
         description: 'タイムアウト (ミリ秒)'
         required: false
-        default: '15000'
+        default: '30000'
+      wait:
+        description: 'JS実行待機時間 (ミリ秒)'
+        required: false
+        default: '3000'
 
 jobs:
   scan:
@@ -32,12 +36,32 @@ jobs:
         with:
           node-version: '20'
 
+      - name: Install dependencies
+        run: npm install puppeteer
+
+      - name: Install Chromium dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libatk-bridge2.0-0 \
+            libdrm2 \
+            libxkbcommon0 \
+            libxcomposite1 \
+            libxdamage1 \
+            libxfixes3 \
+            libxrandr2 \
+            libgbm1 \
+            libasound2t64 \
+            libpango-1.0-0 \
+            libcairo2
+
       - name: Run PSP Detector
         run: |
           node psp-detect.js \
             --output "${{ github.event.inputs.output_file }}" \
             --concurrency "${{ github.event.inputs.concurrency }}" \
             --timeout "${{ github.event.inputs.timeout }}" \
+            --wait "${{ github.event.inputs.wait }}" \
             "${{ github.event.inputs.urls_file }}"
 
       - name: Upload results as artifact
@@ -46,3 +70,12 @@ jobs:
           name: psp-scan-results
           path: ${{ github.event.inputs.output_file }}
           retention-days: 30
+
+      - name: Show summary
+        run: |
+          echo "## PSP Scan Results" >> $GITHUB_STEP_SUMMARY
+          echo "| 項目 | 値 |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-----|" >> $GITHUB_STEP_SUMMARY
+          echo "| URLリスト | ${{ github.event.inputs.urls_file }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 出力ファイル | ${{ github.event.inputs.output_file }} |" >> $GITHUB_STEP_SUMMARY
+          echo "Artifactsタブから結果CSVをダウンロードできます。" >> $GITHUB_STEP_SUMMARY
