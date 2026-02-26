@@ -1,10 +1,10 @@
-  name: PSP Scan
+name: PSP Scan
 
 on:
   workflow_dispatch:
     inputs:
       urls_file:
-        description: 'URLリストファイルのパス (リポジトリ内)'
+        description: 'URLリストファイルのパス'
         required: true
         default: 'urls.txt'
       output_file:
@@ -23,7 +23,6 @@ on:
 jobs:
   scan:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -47,15 +46,3 @@ jobs:
           name: psp-scan-results
           path: ${{ github.event.inputs.output_file }}
           retention-days: 30
-
-      - name: Show summary
-        run: |
-          echo "## PSP Scan Results" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| 項目 | 値 |" >> $GITHUB_STEP_SUMMARY
-          echo "|------|-----|" >> $GITHUB_STEP_SUMMARY
-          echo "| URLリスト | ${{ github.event.inputs.urls_file }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| 出力ファイル | ${{ github.event.inputs.output_file }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| 並列数 | ${{ github.event.inputs.concurrency }} |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Artifactsタブから結果CSVをダウンロードできます。" >> $GITHUB_STEP_SUMMARY
