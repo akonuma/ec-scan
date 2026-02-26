@@ -1,18 +1,17 @@
 #!/usr/bin/env node
 /**
- * PSP Detector - Detects Payment Service Providers used by websites
+ * PSP Detector v2 (Puppeteer版)
  * Usage: node psp-detect.js [options] <urls-file>
  * Options:
  *   --output <file>       Output CSV file (default: results.csv)
- *   --concurrency <n>     Number of parallel requests (default: 5)
- *   --timeout <ms>        Request timeout in ms (default: 15000)
+ *   --concurrency <n>     Number of parallel browsers (default: 3)
+ *   --timeout <ms>        Page load timeout in ms (default: 30000)
+ *   --wait <ms>           Wait after page load for JS execution (default: 3000)
  */
 
-const http = require('http');
-const https = require('https');
+const puppeteer = require('puppeteer');
 const fs = require('fs');
 const path = require('path');
-const url = require('url');
 
 // ── PSP Fingerprint Definitions ──────────────────────────────────────────────
 const PSP_DEFINITIONS = [
@@ -23,6 +22,7 @@ const PSP_DEFINITIONS = [
       /stripe\.com\/v[0-9]/i,
       /pk_(live|test)_[A-Za-z0-9]+/,
       /Stripe\s*\(/,
+      /stripe-js/i,
     ],
   },
   {
@@ -32,7 +32,6 @@ const PSP_DEFINITIONS = [
       /paypalobjects\.com/i,
       /paypal\.Buttons/i,
       /paypal-button/i,
-      /data-partner-attribution-id/i,
     ],
   },
   {
@@ -86,7 +85,6 @@ const PSP_DEFINITIONS = [
       /static\.mul-pay\.com/i,
       /p01\.mul-pay\.com/i,
       /mul-pay\.com/i,
-      /gmo.?payment/i,
       /gmopg/i,
     ],
   },
@@ -95,7 +93,6 @@ const PSP_DEFINITIONS = [
     patterns: [
       /epsilon\.jp/i,
       /epsilonjavascript/i,
-      /gmo.?epsilon/i,
       /trans\.epsilon\.jp/i,
     ],
   },
@@ -103,7 +100,6 @@ const PSP_DEFINITIONS = [
     name: 'DGFT (Digital Garage)',
     patterns: [
       /dgft\.jp/i,
-      /digital-garage.*payment/i,
       /veritrans/i,
       /ks\.veritrans\.co\.jp/i,
       /token\.veritrans\.co\.jp/i,
@@ -111,73 +107,15 @@ const PSP_DEFINITIONS = [
   },
 ];
 
-// ── HTTP Fetch with redirect following ───────────────────────────────────────
-function fetchUrl(targetUrl, timeout = 15000, redirectCount = 0) {
-  return new Promise((resolve, reject) => {
-    if (redirectCount > 10) {
-      return reject(new Error('Too many redirects'));
-    }
-
-    let parsed;
-    try {
-      parsed = new url.URL(targetUrl);
-    } catch (e) {
-      return reject(new Error(`Invalid URL: ${targetUrl}`));
-    }
-
-    const lib = parsed.protocol === 'https:' ? https : http;
-    const options = {
-      hostname: parsed.hostname,
-      port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
-      path: parsed.pathname + parsed.search,
-      method: 'GET',
-      headers: {
-        'User-Agent':
-          'Mozilla/5.0 (compatible; PSPDetector/1.0; +https://github.com/your-org/psp-detector)',
-        Accept: 'text/html,application/xhtml+xml,*/*;q=0.8',
-        'Accept-Language': 'ja,en;q=0.9',
-      },
-      timeout,
-    };
-
-    const req = lib.request(options, (res) => {
-      const { statusCode, headers } = res;
-
-      if ([301, 302, 303, 307, 308].includes(statusCode) && headers.location) {
-        res.destroy();
-        const nextUrl = new url.URL(headers.location, targetUrl).href;
-        return resolve(fetchUrl(nextUrl, timeout, redirectCount + 1));
-      }
-
-      let body = '';
-      res.setEncoding('utf8');
-      res.on('data', (chunk) => {
-        body += chunk;
-        // Limit to 2MB
-        if (body.length > 2 * 1024 * 1024) {
-          res.destroy();
-        }
-      });
-      res.on('end', () => resolve({ statusCode, body, finalUrl: targetUrl }));
-      res.on('error', reject);
-    });
-
-    req.on('timeout', () => {
-      req.destroy(new Error(`Timeout after ${timeout}ms`));
-    });
-    req.on('error', reject);
-    req.end();
-  });
-}
-
 // ── PSP Detection ─────────────────────────────────────────────────────────────
-function detectPSPs(html) {
+function detectPSPs(html, networkUrls) {
+  const allText = html + '\n' + networkUrls.join('\n');
   const detected = [];
   for (const psp of PSP_DEFINITIONS) {
     for (const pattern of psp.patterns) {
-      if (pattern.test(html)) {
+      if (pattern.test(allText)) {
         detected.push(psp.name);
-        break; // One match per PSP is enough
+        break;
       }
     }
   }
@@ -197,7 +135,6 @@ function buildCsv(rows) {
   const allPspNames = PSP_DEFINITIONS.map((p) => p.name);
   const header = ['URL', 'Status', 'Detected PSPs', 'Error', ...allPspNames];
   const lines = [header.map(csvEscape).join(',')];
-
   for (const row of rows) {
     const detectedSet = new Set(row.psps || []);
     const flagCols = allPspNames.map((name) => (detectedSet.has(name) ? '1' : '0'));
@@ -217,38 +154,74 @@ function buildCsv(rows) {
 async function runWithConcurrency(tasks, concurrency) {
   const results = [];
   let index = 0;
-
   async function worker() {
     while (index < tasks.length) {
       const i = index++;
       results[i] = await tasks[i]();
     }
   }
-
   const workers = Array.from({ length: Math.min(concurrency, tasks.length) }, worker);
   await Promise.all(workers);
   return results;
+}
+
+// ── Scan one URL with Puppeteer ───────────────────────────────────────────────
+async function scanUrl(browser, targetUrl, timeout, waitMs) {
+  const page = await browser.newPage();
+  const networkUrls = [];
+
+  // ネットワークリクエストを傍受してPSP関連URLを収集
+  page.on('request', (req) => {
+    networkUrls.push(req.url());
+  });
+
+  // UA偽装（ボット判定回避）
+  await page.setUserAgent(
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+  );
+  await page.setExtraHTTPHeaders({ 'Accept-Language': 'ja-JP,ja;q=0.9,en;q=0.8' });
+
+  let status = '';
+  try {
+    const response = await page.goto(targetUrl, {
+      waitUntil: 'networkidle2',
+      timeout,
+    });
+    status = response ? response.status() : '';
+
+    // JS実行後の追加待機
+    await new Promise((r) => setTimeout(r, waitMs));
+
+    const html = await page.content();
+    const psps = detectPSPs(html, networkUrls);
+    return { url: targetUrl, status, psps, error: '' };
+  } catch (err) {
+    return { url: targetUrl, status, psps: [], error: err.message };
+  } finally {
+    await page.close();
+  }
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 async function main() {
   const args = process.argv.slice(2);
 
-  // Parse args
   let urlsFile = null;
   let outputFile = 'results.csv';
-  let concurrency = 5;
-  let timeout = 15000;
+  let concurrency = 3;
+  let timeout = 30000;
+  let waitMs = 3000;
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--output' && args[i + 1]) outputFile = args[++i];
     else if (args[i] === '--concurrency' && args[i + 1]) concurrency = parseInt(args[++i], 10);
     else if (args[i] === '--timeout' && args[i + 1]) timeout = parseInt(args[++i], 10);
+    else if (args[i] === '--wait' && args[i + 1]) waitMs = parseInt(args[++i], 10);
     else if (!args[i].startsWith('--')) urlsFile = args[i];
   }
 
   if (!urlsFile) {
-    console.error('Usage: node psp-detect.js [--output results.csv] [--concurrency 5] [--timeout 15000] <urls.txt>');
+    console.error('Usage: node psp-detect.js [--output results.csv] [--concurrency 3] [--timeout 30000] [--wait 3000] <urls.txt>');
     process.exit(1);
   }
 
@@ -268,42 +241,39 @@ async function main() {
     process.exit(1);
   }
 
-  console.log(`\n🔍 PSP Detector`);
+  console.log(`\n🔍 PSP Detector v2 (Puppeteer)`);
   console.log(`   URLs:        ${rawUrls.length}`);
   console.log(`   Concurrency: ${concurrency}`);
   console.log(`   Timeout:     ${timeout}ms`);
+  console.log(`   JS Wait:     ${waitMs}ms`);
   console.log(`   Output:      ${outputFile}\n`);
+
+  const browser = await puppeteer.launch({
+    headless: 'new',
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+  });
 
   let completed = 0;
 
   const tasks = rawUrls.map((rawUrl) => async () => {
     const targetUrl = /^https?:\/\//i.test(rawUrl) ? rawUrl : `https://${rawUrl}`;
-    let result;
-
-    try {
-      const { statusCode, body, finalUrl } = await fetchUrl(targetUrl, timeout);
-      const psps = detectPSPs(body);
-      result = { url: targetUrl, finalUrl, status: statusCode, psps, error: '' };
-    } catch (err) {
-      result = { url: targetUrl, status: '', psps: [], error: err.message };
-    }
+    const result = await scanUrl(browser, targetUrl, timeout, waitMs);
 
     completed++;
     const pspLabel = result.psps.length > 0 ? result.psps.join(', ') : 'none';
-    const statusLabel = result.error ? `ERROR` : `HTTP ${result.status}`;
+    const statusLabel = result.error ? 'ERROR' : `HTTP ${result.status}`;
     console.log(`[${completed}/${rawUrls.length}] ${statusLabel.padEnd(10)} ${targetUrl} → ${pspLabel}`);
 
     return result;
   });
 
   const results = await runWithConcurrency(tasks, concurrency);
+  await browser.close();
 
-  // Write CSV with BOM
   const bom = '\uFEFF';
   const csv = bom + buildCsv(results);
   fs.writeFileSync(outputFile, csv, 'utf8');
 
-  // Summary
   const detected = results.filter((r) => r.psps && r.psps.length > 0).length;
   const errors = results.filter((r) => r.error).length;
   console.log(`\n✅ Done!`);
